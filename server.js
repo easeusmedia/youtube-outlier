@@ -199,8 +199,16 @@ async function fetchTranscript(videoId) {
     tracks.find((t) => t.languageCode?.startsWith('en')) ||
     tracks[0];
 
-  const cap = await fetch(pick.baseUrl + '&fmt=json3');
-  if (!cap.ok) throw new Error(`captions ${cap.status}`);
+  // YouTube rate-limits this endpoint hard once you burst it — a few dozen
+  // rapid fetches is enough to earn a 429 that outlasts a minute. Back off
+  // instead of writing "no captions" into the PDF for a video that has them.
+  let cap;
+  for (const wait of [0, 3000, 9000, 20000]) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    cap = await fetch(pick.baseUrl + '&fmt=json3');
+    if (cap.status !== 429) break;
+  }
+  if (!cap.ok) throw new Error(cap.status === 429 ? 'rate-limited by YouTube' : `captions ${cap.status}`);
   const json = await cap.json().catch(() => null);
   const events = json?.events;
   if (!events) throw new Error('caption track was empty');
@@ -220,10 +228,16 @@ async function fetchTranscript(videoId) {
  * PDF
  * ------------------------------------------------------------------ */
 
-// Helvetica is Latin-1 only; a Hindi or Japanese transcript would come out
-// blank. macOS ships a full-Unicode TTF, so use it when it's there.
-const UNICODE_FONT = '/System/Library/Fonts/Supplemental/Arial Unicode.ttf';
-const hasUnicodeFont = fs.existsSync(UNICODE_FONT);
+// Helvetica is Latin-1 only, so anything outside it comes out blank. Look for a
+// wider font: macOS ships Arial Unicode, Render's Debian image ships DejaVu.
+// ponytail: DejaVu still has no Devanagari/CJK — bundle a Noto font if a
+// channel's captions actually come back in one of those scripts.
+const UNICODE_FONT = [
+  '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+  '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+].find((p) => fs.existsSync(p));
+const hasUnicodeFont = !!UNICODE_FONT;
 
 function buildPdf({ channel, items }) {
   return new Promise((resolve, reject) => {
@@ -283,7 +297,7 @@ function buildPdf({ channel, items }) {
  * ------------------------------------------------------------------ */
 
 const jobs = new Map();
-const CONCURRENCY = 4;
+const CONCURRENCY = 2; // 4 gets you 429'd by YouTube on real-size jobs
 
 async function runJob(job, videos) {
   const results = new Array(videos.length);
@@ -353,7 +367,8 @@ app.get('/api/transcripts/:id/pdf', (req, res) => {
 app.get('/api/config', (_req, res) => res.json({ hasKey: !!API_KEY }));
 
 // Only listen when run as the entrypoint, so test.mjs can import the helpers.
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+// argv[1] is undefined under `node -e`, and pathToFileURL throws on undefined.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   app.listen(PORT, () => {
     console.log(`YouTube Outlier  →  http://localhost:${PORT}`);
     if (!API_KEY) console.log('⚠  YOUTUBE_API_KEY missing — add it to .env, then restart.');
