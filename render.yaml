@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: youtube-outlier
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: MAX_VIDEOS
+        value: "2000"
