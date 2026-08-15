@@ -151,19 +151,31 @@ async function fetchAllVideos(uploadsId) {
   return videos;
 }
 
-const channelCache = new Map(); // key -> { at, payload }
-const CACHE_MS = 15 * 60 * 1000;
+// Two caches, because they expire on completely different clocks. Which
+// channel a link points at never changes, so that mapping is kept forever —
+// worth it because resolving a legacy /c/ link costs a 100-unit search, a
+// hundred times more than every other call in this file. The video list does
+// change, so it expires, but keying it by channel id means the five ways of
+// writing the same channel share one entry instead of refetching per spelling.
+const resolveCache = new Map(); // input string -> channel
+const channelCache = new Map(); // channel id -> { at, payload }
+const CACHE_MS = 60 * 60 * 1000;
 
 app.post('/api/channel', async (req, res) => {
   try {
     const key = String(req.body?.url || '').trim().toLowerCase();
-    const hit = channelCache.get(key);
+    let channel = resolveCache.get(key);
+    if (!channel) {
+      channel = await resolveChannel(req.body?.url);
+      resolveCache.set(key, channel);
+    }
+
+    const hit = channelCache.get(channel.id);
     if (hit && Date.now() - hit.at < CACHE_MS) return res.json(hit.payload);
 
-    const channel = await resolveChannel(req.body?.url);
     const videos = await fetchAllVideos(channel.uploads);
     const payload = { channel, videos, truncated: videos.length >= MAX_VIDEOS };
-    channelCache.set(key, { at: Date.now(), payload });
+    channelCache.set(channel.id, { at: Date.now(), payload });
     res.json(payload);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -393,6 +405,20 @@ async function apifyTranscripts(videoIds, onTick) {
 const jobs = new Map();
 const CONCURRENCY = 2; // 4 gets you 429'd by YouTube on real-size jobs
 
+// A video's captions don't change, and on a shared link the same popular
+// videos get requested over and over. Caching them means the second run of a
+// channel costs no Apify credits at all. Capped because transcripts are bulky
+// and Render's free tier only has 512MB.
+const transcriptCache = new Map(); // video id -> { text, lang, auto }
+const TRANSCRIPT_CACHE_MAX = 400;
+
+function rememberTranscript(id, t) {
+  if (transcriptCache.size >= TRANSCRIPT_CACHE_MAX) {
+    transcriptCache.delete(transcriptCache.keys().next().value); // oldest out
+  }
+  transcriptCache.set(id, t);
+}
+
 async function runJob(job, videos) {
   const results = new Array(videos.length);
   let next = 0;
@@ -406,10 +432,19 @@ async function runJob(job, videos) {
       while (next < videos.length) {
         const i = next++;
         const v = videos[i];
+        const cached = transcriptCache.get(v.id);
+        if (cached) {
+          results[i] = { ...v, ...cached };
+          job.ok++;
+          job.done++;
+          job.current = v.title;
+          continue;
+        }
         if (blockedStreak >= 3) { results[i] = { ...v, error: 'blocked by YouTube (bot check)' }; continue; }
         try {
           const t = await fetchTranscript(v.id);
           results[i] = { ...v, ...t };
+          rememberTranscript(v.id, t);
           blockedStreak = 0;
           job.ok++;
           job.done++;
@@ -435,7 +470,9 @@ async function runJob(job, videos) {
         const text = (hit?.non_timestamped || hit?.text || '').replace(/\s+/g, ' ').trim();
         const idx = results.indexOf(r);
         if (text) {
-          results[idx] = { ...r, error: undefined, text, lang: hit.language_code, auto: !!hit.is_generated };
+          const t = { text, lang: hit.language_code, auto: !!hit.is_generated };
+          results[idx] = { ...r, error: undefined, ...t };
+          rememberTranscript(r.id, t);
           job.ok++;
         } else {
           results[idx] = { ...r, error: 'no captions available' };
@@ -496,7 +533,9 @@ app.get('/api/transcripts/:id/pdf', (req, res) => {
   res.send(job.pdf);
 });
 
-app.get('/api/config', (_req, res) => res.json({ hasKey: !!API_KEY }));
+app.get('/api/config', (_req, res) =>
+  res.json({ hasKey: !!API_KEY, apifyTokens: APIFY_TOKENS.length, cached: { channels: channelCache.size, transcripts: transcriptCache.size } })
+);
 
 // Only listen when run as the entrypoint, so test.mjs can import the helpers.
 // argv[1] is undefined under `node -e`, and pathToFileURL throws on undefined.
