@@ -590,6 +590,9 @@ document.querySelectorAll('#seg-format button').forEach((b) => {
     document.querySelectorAll('#seg-format button').forEach((x) => x.classList.remove('active'));
     b.classList.add('active');
     filters.format = b.dataset.format;
+    // A segmented control that needs a second click on Apply reads as broken.
+    page = 1;
+    render();
   };
 });
 

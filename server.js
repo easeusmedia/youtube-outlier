@@ -131,7 +131,11 @@ async function fetchAllVideos(uploadsId) {
         likes: Number(v.statistics.likeCount || 0),
         comments: Number(v.statistics.commentCount || 0),
         seconds,
-        isShort: seconds > 0 && seconds <= 60,
+        // The Data API exposes no "is a Short" flag, so duration is the only
+        // signal. YouTube raised the Shorts ceiling to 3 minutes, and spot
+        // checks against /shorts/<id> confirm 61-180s uploads really are
+        // Shorts — a 60s cutoff leaked them into the long-form filter.
+        isShort: seconds > 0 && seconds <= 180,
       });
     }
   }
@@ -175,23 +179,47 @@ app.post('/api/channel', async (req, res) => {
  * returning caption tracks; IOS still does.
  * ------------------------------------------------------------------ */
 
+// Which player client to impersonate. From a home IP any of these work; from a
+// datacenter IP (Render, EC2) YouTube starts answering LOGIN_REQUIRED — its
+// "confirm you're not a bot" block — and which client survives that varies, so
+// try them in order rather than betting the feature on one.
+const PLAYER_CLIENTS = [
+  { ua: 'com.google.ios.youtube/20.10.4 (iPhone; U; CPU iOS 18_0 like Mac OS X)',
+    client: { clientName: 'IOS', clientVersion: '20.10.4' } },
+  { ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip',
+    client: { clientName: 'ANDROID', clientVersion: '20.10.38', androidSdkVersion: 35 } },
+  { ua: 'Mozilla/5.0',
+    client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', clientScreen: 'EMBED' },
+    thirdParty: { embedUrl: 'https://www.youtube.com' } },
+  { ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    client: { clientName: 'WEB', clientVersion: '2.20250101.00.00' } },
+];
+
+async function playerTracks(videoId) {
+  let lastStatus = '';
+  for (const c of PLAYER_CLIENTS) {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': c.ua },
+      body: JSON.stringify({
+        videoId,
+        context: { client: { ...c.client, hl: 'en', gl: 'US' }, ...(c.thirdParty ? { thirdParty: c.thirdParty } : {}) },
+      }),
+    });
+    if (!res.ok) { lastStatus = `player ${res.status}`; continue; }
+    const data = await res.json().catch(() => null);
+    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (tracks?.length) return tracks;
+    const status = data?.playabilityStatus?.status;
+    lastStatus = status === 'LOGIN_REQUIRED' ? 'blocked by YouTube (bot check)'
+      : status && status !== 'OK' ? String(status).toLowerCase()
+      : 'no captions available';
+  }
+  throw new Error(lastStatus || 'no captions available');
+}
+
 async function fetchTranscript(videoId) {
-  const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'user-agent': 'com.google.ios.youtube/20.10.4 (iPhone; U; CPU iOS 18_0 like Mac OS X)' },
-    body: JSON.stringify({
-      videoId,
-      context: { client: { clientName: 'IOS', clientVersion: '20.10.4', hl: 'en', gl: 'US' } },
-    }),
-  });
-  if (!res.ok) throw new Error(`player ${res.status}`);
-  const data = await res.json();
-
-  const status = data?.playabilityStatus?.status;
-  if (status && status !== 'OK') throw new Error(status === 'LOGIN_REQUIRED' ? 'private or age-restricted' : String(status).toLowerCase());
-
-  const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-  if (!tracks.length) throw new Error('no captions available');
+  const tracks = await playerTracks(videoId);
 
   // Prefer a human English track, then auto-English, then whatever exists.
   const pick =
