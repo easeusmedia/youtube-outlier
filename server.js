@@ -314,6 +314,7 @@ async function runJob(job, videos) {
         } catch (err) {
           results[i] = { ...v, error: err.message };
           job.failed++;
+          job.reasons[err.message] = (job.reasons[err.message] || 0) + 1;
         }
         job.done++;
         job.current = v.title;
@@ -333,7 +334,7 @@ app.post('/api/transcripts', async (req, res) => {
   if (!videos.length || !channel?.title) return res.status(400).json({ error: 'Nothing to transcribe.' });
 
   const id = Math.random().toString(36).slice(2, 10);
-  const job = { id, channel, total: videos.length, done: 0, ok: 0, failed: 0, status: 'running', current: '' };
+  const job = { id, channel, total: videos.length, done: 0, ok: 0, failed: 0, status: 'running', current: '', reasons: {} };
   jobs.set(id, job);
 
   runJob(job, videos).catch((err) => {
@@ -351,8 +352,8 @@ app.post('/api/transcripts', async (req, res) => {
 app.get('/api/transcripts/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job expired or not found.' });
-  const { id, total, done, ok, failed, status, current, error } = job;
-  res.json({ id, total, done, ok, failed, status, current, error, ready: status === 'done' });
+  const { id, total, done, ok, failed, status, current, error, reasons } = job;
+  res.json({ id, total, done, ok, failed, status, current, error, reasons, ready: status === 'done' });
 });
 
 app.get('/api/transcripts/:id/pdf', (req, res) => {
