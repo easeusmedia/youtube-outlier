@@ -4,7 +4,7 @@ import fs from 'fs';
 import { pathToFileURL } from 'url';
 import PDFDocument from 'pdfkit';
 
-const API_KEY = process.env.YOUTUBE_API_KEY;
+const API_KEY = process.env.YOUTUBE_API_KEY || process.env.API_KEY;
 const PORT = process.env.PORT || 3100;
 const MAX_VIDEOS = Number(process.env.MAX_VIDEOS || 2000);
 
