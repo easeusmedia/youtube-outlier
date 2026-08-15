@@ -321,6 +321,72 @@ function buildPdf({ channel, items }) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Apify fallback
+ *
+ * Direct fetching works from a home IP but YouTube answers LOGIN_REQUIRED
+ * ("confirm you're not a bot") to datacenter IPs, so on Render every video
+ * fails. Apify runs through residential proxies and isn't blocked. Tokens are
+ * tried in order so a drained account rolls over to the next one.
+ * ------------------------------------------------------------------ */
+
+const APIFY_TOKENS = (process.env.APIFY_TOKENS || process.env.APIFY_TOKEN || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const APIFY_ACTOR = 'johnvc~YoutubeTranscripts';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const isBlocked = (msg) => /blocked by YouTube|rate-limited/i.test(msg || '');
+
+async function apifyTranscripts(videoIds, onTick) {
+  if (!APIFY_TOKENS.length) throw new Error('no Apify token configured');
+  const input = {
+    youtube_url: videoIds.map((id) => `https://www.youtube.com/watch?v=${id}`),
+    languages: ['en'],
+    output_formats: ['text'],
+    include_metadata: false,
+  };
+
+  let lastErr = '';
+  for (const [n, token] of APIFY_TOKENS.entries()) {
+    try {
+      const start = await fetch(`https://api.apify.com/v2/acts/${APIFY_ACTOR}/runs?token=${token}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      // 402 is Apify's "out of credit"; 401/403 means the token is dead. Both
+      // are worth rolling over to the next token for. Anything else is not.
+      if ([401, 402, 403].includes(start.status)) {
+        lastErr = `Apify token ${n + 1} rejected (${start.status})`;
+        continue;
+      }
+      if (!start.ok) throw new Error(`Apify start failed (${start.status})`);
+
+      let run = (await start.json()).data;
+      while (run.status === 'READY' || run.status === 'RUNNING') {
+        await sleep(4000);
+        const poll = await fetch(`https://api.apify.com/v2/actor-runs/${run.id}?token=${token}`);
+        if (!poll.ok) throw new Error(`Apify poll failed (${poll.status})`);
+        run = (await poll.json()).data;
+        onTick?.();
+      }
+      if (run.status !== 'SUCCEEDED') {
+        lastErr = `Apify run ${run.status.toLowerCase()}`;
+        continue; // a run that aborts on one account may succeed on another
+      }
+
+      const items = await fetch(
+        `https://api.apify.com/v2/datasets/${run.defaultDatasetId}/items?token=${token}&clean=true`
+      );
+      if (!items.ok) throw new Error(`Apify results failed (${items.status})`);
+      return await items.json();
+    } catch (err) {
+      lastErr = err.message;
+    }
+  }
+  throw new Error(lastErr || 'Apify fallback failed');
+}
+
+/* ------------------------------------------------------------------ *
  * Transcript jobs
  * ------------------------------------------------------------------ */
 
@@ -330,26 +396,63 @@ const CONCURRENCY = 2; // 4 gets you 429'd by YouTube on real-size jobs
 async function runJob(job, videos) {
   const results = new Array(videos.length);
   let next = 0;
+  let blockedStreak = 0;
+
+  // Pass 1: fetch direct. Free and instant from an unblocked IP. Once YouTube
+  // has refused three in a row it will refuse all of them, so stop paying the
+  // four-client round trip per video and let Apify take the rest.
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, videos.length) }, async () => {
       while (next < videos.length) {
         const i = next++;
         const v = videos[i];
+        if (blockedStreak >= 3) { results[i] = { ...v, error: 'blocked by YouTube (bot check)' }; continue; }
         try {
           const t = await fetchTranscript(v.id);
           results[i] = { ...v, ...t };
+          blockedStreak = 0;
           job.ok++;
+          job.done++;
         } catch (err) {
           results[i] = { ...v, error: err.message };
-          job.failed++;
-          job.reasons[err.message] = (job.reasons[err.message] || 0) + 1;
+          if (isBlocked(err.message)) blockedStreak++; else { job.failed++; job.done++; }
         }
-        job.done++;
         job.current = v.title;
       }
     })
   );
 
+  // Pass 2: hand everything YouTube blocked to Apify, in one batched run.
+  const retry = results.filter((r) => isBlocked(r.error));
+  if (retry.length && APIFY_TOKENS.length) {
+    job.stage = 'apify';
+    job.current = `Routing ${retry.length} videos through Apify…`;
+    try {
+      const items = await apifyTranscripts(retry.map((r) => r.id));
+      const byId = new Map(items.map((it) => [it.video_id, it]));
+      for (const r of retry) {
+        const hit = byId.get(r.id);
+        const text = (hit?.non_timestamped || hit?.text || '').replace(/\s+/g, ' ').trim();
+        const idx = results.indexOf(r);
+        if (text) {
+          results[idx] = { ...r, error: undefined, text, lang: hit.language_code, auto: !!hit.is_generated };
+          job.ok++;
+        } else {
+          results[idx] = { ...r, error: 'no captions available' };
+          job.failed++;
+        }
+        job.done++;
+      }
+    } catch (err) {
+      for (const r of retry) { job.failed++; job.done++; r.error = err.message; }
+    }
+  } else {
+    for (const r of retry) { job.failed++; job.done++; }
+  }
+
+  for (const r of results) if (r.error) job.reasons[r.error] = (job.reasons[r.error] || 0) + 1;
+
+  job.stage = 'building';
   job.status = 'building';
   job.pdf = await buildPdf({ channel: job.channel, items: results });
   job.status = 'done';
@@ -362,7 +465,7 @@ app.post('/api/transcripts', async (req, res) => {
   if (!videos.length || !channel?.title) return res.status(400).json({ error: 'Nothing to transcribe.' });
 
   const id = Math.random().toString(36).slice(2, 10);
-  const job = { id, channel, total: videos.length, done: 0, ok: 0, failed: 0, status: 'running', current: '', reasons: {} };
+  const job = { id, channel, total: videos.length, done: 0, ok: 0, failed: 0, status: 'running', current: '', stage: 'direct', reasons: {} };
   jobs.set(id, job);
 
   runJob(job, videos).catch((err) => {
@@ -380,8 +483,8 @@ app.post('/api/transcripts', async (req, res) => {
 app.get('/api/transcripts/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job expired or not found.' });
-  const { id, total, done, ok, failed, status, current, error, reasons } = job;
-  res.json({ id, total, done, ok, failed, status, current, error, reasons, ready: status === 'done' });
+  const { id, total, done, ok, failed, status, current, error, reasons, stage } = job;
+  res.json({ id, total, done, ok, failed, status, current, error, reasons, stage, ready: status === 'done' });
 });
 
 app.get('/api/transcripts/:id/pdf', (req, res) => {

@@ -551,6 +551,9 @@ async function checkJob() {
   if (j.status === 'building') {
     $('job-sub').textContent = 'All captions in. Writing the PDF…';
     $('job-current').innerHTML = '<span class="pulse">Building the PDF — nearly there…</span>';
+  } else if (j.stage === 'apify') {
+    $('job-sub').textContent = 'YouTube blocked this server, so these are coming via Apify.';
+    $('job-current').innerHTML = '<span class="pulse">' + esc(j.current || 'Fetching through Apify…') + '</span>';
   } else {
     $('job-current').innerHTML = j.current ? '<span class="pulse">Now: ' + esc(j.current) + '</span>' : '';
   }
