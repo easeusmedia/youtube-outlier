@@ -354,6 +354,13 @@ const APIFY_TOKENS = (process.env.APIFY_TOKENS || process.env.APIFY_TOKEN || '')
 const APIFY_ACTOR = 'johnvc~YoutubeTranscripts';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Being cut off by YouTube is a property of the host, not of the job. Measured
+// on Render, rediscovering it costs ~70s per job: every video walks four player
+// clients before failing. Remember it instead, and re-test occasionally in case
+// the host's standing recovers.
+let directBlockedUntil = 0;
+const BLOCK_MEMORY_MS = 30 * 60 * 1000;
+
 // Don't gate the Apify fallback on a list of known block symptoms. YouTube has
 // already changed shape once — it used to refuse with a 200 carrying
 // LOGIN_REQUIRED, now it's a bare 403 — and the old whitelist silently stopped
@@ -368,17 +375,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isTransportFailure = (msg) =>
   /blocked by YouTube|rate-limited|player \d+|captions \d+|fetch failed|network/i.test(msg || '');
 
-async function apifyTranscripts(videoIds, onTick) {
-  if (!APIFY_TOKENS.length) throw new Error('no Apify token configured');
+// One run over one token, with the token list rotated so parallel chunks start
+// on different accounts. Still falls over to the others if a token is dead.
+async function apifyRun(videoIds, tokens, onCount) {
   const input = {
     youtube_url: videoIds.map((id) => `https://www.youtube.com/watch?v=${id}`),
-    languages: ['en'],
+    // No language filter. Pinning this to English dropped every video whose
+    // only captions were in another language, and they were then reported as
+    // having no captions at all.
     output_formats: ['text'],
     include_metadata: false,
   };
 
   let lastErr = '';
-  for (const [n, token] of APIFY_TOKENS.entries()) {
+  for (const [n, token] of tokens.entries()) {
     try {
       const start = await fetch(`https://api.apify.com/v2/acts/${APIFY_ACTOR}/runs?token=${token}`, {
         method: 'POST',
@@ -394,12 +404,21 @@ async function apifyTranscripts(videoIds, onTick) {
       if (!start.ok) throw new Error(`Apify start failed (${start.status})`);
 
       let run = (await start.json()).data;
+      let counted = 0;
       while (run.status === 'READY' || run.status === 'RUNNING') {
-        await sleep(4000);
+        await sleep(3000);
         const poll = await fetch(`https://api.apify.com/v2/actor-runs/${run.id}?token=${token}`);
         if (!poll.ok) throw new Error(`Apify poll failed (${poll.status})`);
         run = (await poll.json()).data;
-        onTick?.();
+        // The dataset fills as the run works, so its item count is real
+        // progress — without it the bar sits frozen for minutes.
+        if (run.defaultDatasetId) {
+          const info = await fetch(`https://api.apify.com/v2/datasets/${run.defaultDatasetId}?token=${token}`)
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null);
+          const done = info?.data?.itemCount ?? 0;
+          if (done > counted) { onCount?.(done - counted); counted = done; }
+        }
       }
       if (run.status !== 'SUCCEEDED') {
         lastErr = `Apify run ${run.status.toLowerCase()}`;
@@ -416,6 +435,32 @@ async function apifyTranscripts(videoIds, onTick) {
     }
   }
   throw new Error(lastErr || 'Apify fallback failed');
+}
+
+// Split a batch across the available accounts and run them at the same time.
+// A run costs ~25s of startup regardless of size, so splitting only pays once
+// there's enough work to amortise it — below that, one run is faster.
+async function apifyTranscripts(videoIds, onCount) {
+  if (!APIFY_TOKENS.length) throw new Error('no Apify token configured');
+  const lanes = Math.max(1, Math.min(APIFY_TOKENS.length, Math.ceil(videoIds.length / 25)));
+  const per = Math.ceil(videoIds.length / lanes);
+
+  const chunks = Array.from({ length: lanes }, (_, i) => videoIds.slice(i * per, (i + 1) * per))
+    .filter((c) => c.length);
+
+  const settled = await Promise.allSettled(
+    chunks.map((chunk, i) =>
+      // Rotate so lane 0 starts on token 0, lane 1 on token 1, and so on, each
+      // still able to fall back through the rest.
+      apifyRun(chunk, [...APIFY_TOKENS.slice(i), ...APIFY_TOKENS.slice(0, i)], onCount)
+    )
+  );
+
+  const items = settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
+  if (!items.length && settled.every((r) => r.status === 'rejected')) {
+    throw new Error(settled[0].reason?.message || 'Apify fallback failed');
+  }
+  return items;
 }
 
 /* ------------------------------------------------------------------ *
@@ -446,7 +491,10 @@ async function runJob(job, videos) {
 
   // Pass 1: fetch direct. Free and instant from an unblocked IP. Once YouTube
   // has refused three in a row it will refuse all of them, so stop paying the
-  // four-client round trip per video and let Apify take the rest.
+  // four-client round trip per video and let Apify take the rest — and
+  // remember that, so the next job doesn't rediscover it the slow way.
+  const hostBlocked = Date.now() < directBlockedUntil;
+  if (hostBlocked) blockedStreak = 3;
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, videos.length) }, async () => {
       while (next < videos.length) {
@@ -471,7 +519,9 @@ async function runJob(job, videos) {
         } catch (err) {
           results[i] = { ...v, error: err.message };
           // Counting happens in pass 2, which decides each video's real fate.
-          if (isTransportFailure(err.message)) blockedStreak++; else blockedStreak = 0;
+          if (isTransportFailure(err.message)) {
+            if (++blockedStreak >= 3) directBlockedUntil = Date.now() + BLOCK_MEMORY_MS;
+          } else blockedStreak = 0;
         }
         job.current = v.title;
       }
@@ -482,9 +532,14 @@ async function runJob(job, videos) {
   const retry = results.filter((r) => r.error);
   if (retry.length && APIFY_TOKENS.length) {
     job.stage = 'apify';
-    job.current = `Routing ${retry.length} videos through Apify…`;
+    job.current = `Fetching ${retry.length} transcripts through Apify…`;
+    // Provisional progress so the bar moves during a pass that can run for
+    // minutes; the loop below then counts each video for real, so back out
+    // exactly what was streamed rather than guessing.
+    let streamed = 0;
     try {
-      const items = await apifyTranscripts(retry.map((r) => r.id));
+      const items = await apifyTranscripts(retry.map((r) => r.id), (n) => { streamed += n; job.done += n; });
+      job.done -= streamed;
       const byId = new Map(items.map((it) => [it.video_id, it]));
       for (const r of retry) {
         const hit = byId.get(r.id);
@@ -502,6 +557,7 @@ async function runJob(job, videos) {
         job.done++;
       }
     } catch (err) {
+      job.done -= streamed;
       for (const r of retry) { job.failed++; job.done++; r.error = err.message; }
     }
   } else {

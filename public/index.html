@@ -613,7 +613,11 @@ async function checkJob() {
 
   $('job-bar').style.width = Math.round((j.done / j.total) * 100) + '%';
   $('job-progress').textContent = `${j.done} / ${j.total}`;
-  $('job-failed').textContent = j.failed ? `${j.failed} without captions` : '';
+  // "12 without captions" read as a failure of the tool. Say which videos and
+  // why, so it reads as a fact about those videos instead.
+  $('job-failed').textContent = j.failed
+    ? `${j.failed} of ${j.total} have no subtitles on YouTube`
+    : '';
   if (j.status === 'building') {
     $('job-sub').textContent = 'All captions in. Writing the PDF…';
     $('job-current').innerHTML = '<span class="pulse">Building the PDF — nearly there…</span>';
@@ -627,7 +631,9 @@ async function checkJob() {
   if (j.ready) {
     clearInterval(poll); poll = null;
     $('job-title').textContent = 'Transcripts ready';
-    $('job-sub').textContent = `${j.ok} of ${j.total} videos had captions.`;
+    $('job-sub').textContent = j.failed
+      ? `${j.ok} of ${j.total} transcribed. The other ${j.failed} have no subtitles on YouTube, so there is nothing to pull.`
+      : `All ${j.ok} videos transcribed.`;
     $('job-loader').classList.add('done');
     $('job-current').textContent = '';
     $('job-done').classList.add('show');
