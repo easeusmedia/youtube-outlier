@@ -586,7 +586,7 @@ async function startTranscripts() {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       channel,
-      videos: list.map((v) => ({ id: v.id, title: v.title, views: v.views, publishedAt: v.publishedAt })),
+      videos: list.map((v) => ({ id: v.id, title: v.title, views: v.views, publishedAt: v.publishedAt, seconds: v.seconds })),
     }),
   });
   const data = await res.json();

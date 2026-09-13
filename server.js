@@ -3,6 +3,7 @@ import express from 'express';
 import fs from 'fs';
 import { pathToFileURL } from 'url';
 import PDFDocument from 'pdfkit';
+import pg from 'pg';
 
 const API_KEY = process.env.YOUTUBE_API_KEY || process.env.API_KEY;
 const PORT = process.env.PORT || 3100;
@@ -140,15 +141,176 @@ async function fetchAllVideos(uploadsId) {
     }
   }
 
-  // Outlier score = views / median views, measured within the video's own
-  // format. Shorts routinely out-view long-form 50:1 on the same channel, so
-  // pooling them makes every Short an "outlier" and hides the real ones.
+  scoreOutliers(videos);
+  return videos;
+}
+
+// Outlier score = views / median views, measured within the video's own
+// format. Shorts routinely out-view long-form 50:1 on the same channel, so
+// pooling them makes every Short an "outlier" and hides the real ones. Applied
+// on the way out of the database too, so a cached channel scores identically.
+function scoreOutliers(videos) {
   for (const kind of [true, false]) {
     const group = videos.filter((v) => v.isShort === kind);
     const base = median(group.map((v) => v.views)) || 1;
     for (const v of group) v.outlier = Math.round((v.views / base) * 100) / 100;
   }
   return videos;
+}
+
+/* ------------------------------------------------------------------ *
+ * Persistence
+ *
+ * Optional: without DATABASE_URL everything still works, just from memory.
+ * It matters on Render's free tier, where the instance sleeps after 15
+ * minutes and every cold start otherwise re-fetched the whole channel.
+ * Tables are yt_-prefixed so this can share a database with another app.
+ * Transcripts are deliberately not stored — only what makes a channel load
+ * fast.
+ * ------------------------------------------------------------------ */
+
+const pool = process.env.DATABASE_URL
+  ? new pg.Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 4,
+    })
+  : null;
+
+async function initDb() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS yt_channels (
+      id           TEXT PRIMARY KEY,
+      title        TEXT NOT NULL,
+      handle       TEXT,
+      avatar       TEXT,
+      subs         BIGINT,
+      hidden_subs  BOOLEAN,
+      video_count  INTEGER,
+      uploads      TEXT,
+      fetched_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS yt_videos (
+      id           TEXT PRIMARY KEY,
+      channel_id   TEXT NOT NULL,
+      title        TEXT,
+      thumb        TEXT,
+      published_at TIMESTAMPTZ,
+      views        BIGINT,
+      likes        BIGINT,
+      comments     BIGINT,
+      seconds      INTEGER,
+      is_short     BOOLEAN
+    );
+    CREATE INDEX IF NOT EXISTS yt_videos_channel ON yt_videos (channel_id);
+    -- Every spelling of a link that resolved to a channel. Worth persisting on
+    -- its own: a legacy /c/ link costs a 100-unit search to resolve, against 1
+    -- unit for everything else here.
+    CREATE TABLE IF NOT EXISTS yt_aliases (
+      alias      TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL
+    );
+  `);
+  console.log('database ready');
+}
+
+async function dbGetAlias(alias) {
+  if (!pool) return null;
+  const { rows } = await pool.query('SELECT channel_id FROM yt_aliases WHERE alias = $1', [alias]);
+  return rows[0]?.channel_id || null;
+}
+
+async function dbSaveAlias(alias, channelId) {
+  if (!pool) return;
+  await pool.query(
+    'INSERT INTO yt_aliases (alias, channel_id) VALUES ($1, $2) ON CONFLICT (alias) DO UPDATE SET channel_id = EXCLUDED.channel_id',
+    [alias, channelId]
+  );
+}
+
+async function dbLoadChannel(channelId) {
+  if (!pool) return null;
+  const { rows } = await pool.query('SELECT * FROM yt_channels WHERE id = $1', [channelId]);
+  const c = rows[0];
+  if (!c) return null;
+  const { rows: vids } = await pool.query(
+    'SELECT * FROM yt_videos WHERE channel_id = $1 ORDER BY published_at DESC',
+    [channelId]
+  );
+  return {
+    channel: {
+      id: c.id,
+      title: c.title,
+      handle: c.handle || '',
+      avatar: c.avatar || '',
+      subs: Number(c.subs || 0),
+      hiddenSubs: !!c.hidden_subs,
+      videoCount: Number(c.video_count || 0),
+      uploads: c.uploads,
+    },
+    videos: scoreOutliers(
+      vids.map((v) => ({
+        id: v.id,
+        title: v.title,
+        thumb: v.thumb || '',
+        publishedAt: new Date(v.published_at).toISOString(),
+        views: Number(v.views || 0),
+        likes: Number(v.likes || 0),
+        comments: Number(v.comments || 0),
+        seconds: v.seconds || 0,
+        isShort: !!v.is_short,
+      }))
+    ),
+    fetchedAt: new Date(c.fetched_at).getTime(),
+  };
+}
+
+async function dbSaveChannel(channel, videos) {
+  if (!pool) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO yt_channels (id, title, handle, avatar, subs, hidden_subs, video_count, uploads, fetched_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+       ON CONFLICT (id) DO UPDATE SET
+         title = EXCLUDED.title, handle = EXCLUDED.handle, avatar = EXCLUDED.avatar,
+         subs = EXCLUDED.subs, hidden_subs = EXCLUDED.hidden_subs,
+         video_count = EXCLUDED.video_count, uploads = EXCLUDED.uploads, fetched_at = now()`,
+      [channel.id, channel.title, channel.handle, channel.avatar, channel.subs,
+       channel.hiddenSubs, channel.videoCount, channel.uploads]
+    );
+
+    // Chunked so the statement stays well inside Postgres' parameter ceiling.
+    const COLS = 10;
+    for (let i = 0; i < videos.length; i += 400) {
+      const batch = videos.slice(i, i + 400);
+      const params = [];
+      const tuples = batch.map((v, n) => {
+        params.push(v.id, channel.id, v.title, v.thumb, v.publishedAt,
+                    v.views, v.likes, v.comments, v.seconds, v.isShort);
+        const b = n * COLS;
+        return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10})`;
+      });
+      await client.query(
+        `INSERT INTO yt_videos (id, channel_id, title, thumb, published_at, views, likes, comments, seconds, is_short)
+         VALUES ${tuples.join(',')}
+         ON CONFLICT (id) DO UPDATE SET
+           title = EXCLUDED.title, thumb = EXCLUDED.thumb, published_at = EXCLUDED.published_at,
+           views = EXCLUDED.views, likes = EXCLUDED.likes, comments = EXCLUDED.comments,
+           seconds = EXCLUDED.seconds, is_short = EXCLUDED.is_short`,
+        params
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    // A cache that can't write is not a reason to fail the request.
+    console.error('db save failed:', err.message);
+  } finally {
+    client.release();
+  }
 }
 
 // Two caches, because they expire on completely different clocks. Which
@@ -164,11 +326,27 @@ const CACHE_MS = 60 * 60 * 1000;
 app.post('/api/channel', async (req, res) => {
   try {
     const key = String(req.body?.url || '').trim().toLowerCase();
+
+    // Memory first, then the database, then YouTube — cheapest to dearest.
     let channel = resolveCache.get(key);
+    if (!channel) {
+      const knownId = await dbGetAlias(key).catch(() => null);
+      const stored = knownId ? await dbLoadChannel(knownId).catch(() => null) : null;
+      if (stored) {
+        channel = stored.channel;
+        resolveCache.set(key, channel);
+        if (stored.videos.length && Date.now() - stored.fetchedAt < CACHE_MS) {
+          const payload = { channel, videos: stored.videos, truncated: false, cached: true };
+          channelCache.set(channel.id, { at: stored.fetchedAt, payload });
+          return res.json(payload);
+        }
+      }
+    }
     if (!channel) {
       channel = await resolveChannel(req.body?.url);
       resolveCache.set(key, channel);
     }
+    dbSaveAlias(key, channel.id).catch(() => {});
 
     const hit = channelCache.get(channel.id);
     if (hit && Date.now() - hit.at < CACHE_MS) return res.json(hit.payload);
@@ -177,6 +355,8 @@ app.post('/api/channel', async (req, res) => {
     const payload = { channel, videos, truncated: videos.length >= MAX_VIDEOS };
     channelCache.set(channel.id, { at: Date.now(), payload });
     res.json(payload);
+    // After responding: the caller waited long enough already.
+    dbSaveChannel(channel, videos).catch((err) => console.error('db save failed:', err.message));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -506,9 +686,28 @@ const BLOCK_MEMORY_MS = 30 * 60 * 1000;
 const isTransportFailure = (msg) =>
   /blocked by YouTube|rate-limited|player \d+|captions \d+|fetch failed|network/i.test(msg || '');
 
-// One run over one token, with the token list rotated so parallel chunks start
-// on different accounts. Still falls over to the others if a token is dead.
-async function apifyRun(videoIds, tokens, onCount) {
+// How the work is cut up. A run costs roughly 20s of startup no matter how big
+// it is, and about 3s per video inside it, so wall time for one chunk is
+// ~20 + 3*CHUNK. Small chunks therefore finish sooner, and because every chunk
+// runs at the same time, 100 videos take about as long as 5 do. Each account
+// allows 16GB of concurrent actor memory against this actor's 256MB, so ~64
+// runs fit per token; 8 is deliberately well under that.
+// A free Apify account allows exactly 5 concurrent Actor runs. This is not in
+// the limits API — maxConcurrentActorRuns reads null, and the memory ceiling
+// (16GB against this actor's 256MB) suggests ~64 would fit. Exceed it and the
+// run is refused with 402 concurrent-runs-limit-exceeded.
+const APIFY_RUNS_PER_TOKEN = Number(process.env.APIFY_RUNS_PER_TOKEN || 5);
+// Chunk size is normally derived, not fixed: see apifyTranscripts.
+const APIFY_CHUNK = Number(process.env.APIFY_CHUNK || 0);
+
+// A token that is out of credit stays out of credit, so stop dealing it into
+// the rotation for the life of the process.
+const deadTokens = new Set();
+const liveTokens = () => APIFY_TOKENS.filter((t) => !deadTokens.has(t));
+
+// One chunk, one run. Tries the given tokens in order so a dead or throttled
+// account rolls over instead of failing the chunk.
+async function apifyRun(videoIds, tokens) {
   const input = {
     youtube_url: videoIds.map((id) => `https://www.youtube.com/watch?v=${id}`),
     // No language filter. Pinning this to English dropped every video whose
@@ -519,37 +718,44 @@ async function apifyRun(videoIds, tokens, onCount) {
   };
 
   let lastErr = '';
-  for (const [n, token] of tokens.entries()) {
+  for (const token of tokens) {
     try {
-      const start = await fetch(`https://api.apify.com/v2/acts/${APIFY_ACTOR}/runs?token=${token}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(input),
-      });
-      // 402 is Apify's "out of credit"; 401/403 means the token is dead. Both
-      // are worth rolling over to the next token for. Anything else is not.
-      if ([401, 402, 403].includes(start.status)) {
-        lastErr = `Apify token ${n + 1} rejected (${start.status})`;
+      let start;
+      // 429 is Apify asking us to slow down, not a failure — back off in place
+      // rather than burning a token rollover on it.
+      for (const wait of [0, 2000, 6000, 15000]) {
+        if (wait) await sleep(wait);
+        start = await fetch(`https://api.apify.com/v2/acts/${APIFY_ACTOR}/runs?token=${token}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(input),
+        });
+        if (start.status !== 429) break;
+      }
+
+      // 402 covers two very different things. "concurrent-runs-limit-exceeded"
+      // is backpressure — the account is fine, we simply asked for too much at
+      // once — and benching the token for it took all three accounts out of
+      // rotation mid-job. Only a real usage limit, or 401/403, kills a token.
+      if (start.status === 402 || start.status === 401 || start.status === 403) {
+        const detail = await start.text().catch(() => '');
+        if (/concurrent-runs-limit-exceeded/.test(detail)) {
+          lastErr = 'Apify concurrency limit';
+          await sleep(4000 + Math.random() * 4000);
+          continue;
+        }
+        deadTokens.add(token);
+        lastErr = `Apify token rejected (${start.status})`;
         continue;
       }
       if (!start.ok) throw new Error(`Apify start failed (${start.status})`);
 
       let run = (await start.json()).data;
-      let counted = 0;
       while (run.status === 'READY' || run.status === 'RUNNING') {
-        await sleep(3000);
+        await sleep(2000);
         const poll = await fetch(`https://api.apify.com/v2/actor-runs/${run.id}?token=${token}`);
         if (!poll.ok) throw new Error(`Apify poll failed (${poll.status})`);
         run = (await poll.json()).data;
-        // The dataset fills as the run works, so its item count is real
-        // progress — without it the bar sits frozen for minutes.
-        if (run.defaultDatasetId) {
-          const info = await fetch(`https://api.apify.com/v2/datasets/${run.defaultDatasetId}?token=${token}`)
-            .then((r) => (r.ok ? r.json() : null))
-            .catch(() => null);
-          const done = info?.data?.itemCount ?? 0;
-          if (done > counted) { onCount?.(done - counted); counted = done; }
-        }
       }
       if (run.status !== 'SUCCEEDED') {
         lastErr = `Apify run ${run.status.toLowerCase()}`;
@@ -568,29 +774,92 @@ async function apifyRun(videoIds, tokens, onCount) {
   throw new Error(lastErr || 'Apify fallback failed');
 }
 
-// Split a batch across the available accounts and run them at the same time.
-// A run costs ~25s of startup regardless of size, so splitting only pays once
-// there's enough work to amortise it — below that, one run is faster.
-async function apifyTranscripts(videoIds, onCount) {
-  if (!APIFY_TOKENS.length) throw new Error('no Apify token configured');
-  const lanes = Math.max(1, Math.min(APIFY_TOKENS.length, Math.ceil(videoIds.length / 25)));
-  const per = Math.ceil(videoIds.length / lanes);
+// Split the batch into small chunks and keep a fixed number of runs in flight
+// across all the accounts at once, each worker starting on a different token so
+// the load spreads. Chunks that fail outright are skipped rather than sinking
+// the whole job: their videos simply come back without a transcript.
+async function apifyTranscripts(videos, onCount) {
+  const tokens = liveTokens();
+  if (!tokens.length) throw new Error('no Apify token configured');
 
-  const chunks = Array.from({ length: lanes }, (_, i) => videoIds.slice(i * per, (i + 1) * per))
-    .filter((c) => c.length);
+  // Accepts bare ids or { id, seconds }.
+  const list = videos.map((v) => (typeof v === 'string' ? { id: v, seconds: 0 } : v));
 
-  const settled = await Promise.allSettled(
-    chunks.map((chunk, i) =>
-      // Rotate so lane 0 starts on token 0, lane 1 on token 1, and so on, each
-      // still able to fall back through the rest.
-      apifyRun(chunk, [...APIFY_TOKENS.slice(i), ...APIFY_TOKENS.slice(0, i)], onCount)
-    )
+  // Every run costs ~20s of startup and all of them go at once, so the job takes
+  // as long as its slowest chunk. Two things follow.
+  //
+  // First, with a hard ceiling on runs in flight, the fastest layout is the one
+  // where every chunk starts immediately: as many chunks as there are slots,
+  // rather than a fixed batch size that leaves later chunks queuing.
+  //
+  // Second, a chunk's duration is driven by the length of the videos in it, so
+  // splitting the list in order piles the long ones together. Measured on 118
+  // videos, 70 were done in 32s and the last few dragged the job to 133s.
+  // Dealing longest-first round-robin evens the chunks out.
+  const slots = tokens.length * APIFY_RUNS_PER_TOKEN;
+  const count = APIFY_CHUNK
+    ? Math.ceil(list.length / APIFY_CHUNK)
+    : Math.min(slots, Math.max(1, Math.ceil(list.length / 2)));
+
+  const buckets = Array.from({ length: count }, () => []);
+  [...list]
+    .sort((a, b) => (b.seconds || 0) - (a.seconds || 0))
+    .forEach((v, i) => buckets[i % count].push(v.id));
+  const chunks = buckets.filter((b) => b.length);
+
+  const workers = Math.min(chunks.length, slots);
+  const items = [];
+  const errors = [];
+  const failed = [];
+  let next = 0;
+
+  await Promise.all(
+    Array.from({ length: workers }, async (_, w) => {
+      while (next < chunks.length) {
+        const chunk = chunks[next++];
+        // Start each worker on its own token, still able to fall through the
+        // rest of them.
+        const live = liveTokens();
+        if (!live.length) { errors.push(new Error('all Apify tokens are out of credit')); return; }
+        const order = [...live.slice(w % live.length), ...live.slice(0, w % live.length)];
+        try {
+          const got = await apifyRun(chunk, order);
+          items.push(...got);
+          onCount?.(chunk.length);
+        } catch (err) {
+          console.error('apify chunk failed:', err.message);
+          errors.push(err);
+          failed.push(chunk);
+        }
+      }
+    })
   );
 
-  const items = settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
-  if (!items.length && settled.every((r) => r.status === 'rejected')) {
-    throw new Error(settled[0].reason?.message || 'Apify fallback failed');
+  // Chunks do fail under load — Apify throttles, a run aborts. Left alone they
+  // become "no captions available" in the PDF, which is a lie about the video.
+  // Retry them once, gently: a few at a time rather than all at once.
+  if (failed.length) {
+    console.error(`apify: retrying ${failed.length} failed chunk(s)`);
+    let r = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(3, failed.length) }, async () => {
+        while (r < failed.length) {
+          const chunk = failed[r++];
+          const live = liveTokens();
+          if (!live.length) return;
+          try {
+            const got = await apifyRun(chunk, live);
+            items.push(...got);
+            onCount?.(chunk.length);
+          } catch (err) {
+            console.error('apify chunk failed on retry:', err.message);
+          }
+        }
+      })
+    );
   }
+
+  if (!items.length && errors.length) throw errors[0];
   return items;
 }
 
@@ -669,7 +938,10 @@ async function runJob(job, videos) {
     // exactly what was streamed rather than guessing.
     let streamed = 0;
     try {
-      const items = await apifyTranscripts(retry.map((r) => r.id), (n) => { streamed += n; job.done += n; });
+      const items = await apifyTranscripts(
+        retry.map((r) => ({ id: r.id, seconds: r.seconds || 0 })),
+        (n) => { streamed += n; job.done += n; }
+      );
       job.done -= streamed;
       const byId = new Map(items.map((it) => [it.video_id, it]));
       for (const r of retry) {
@@ -742,16 +1014,18 @@ app.get('/api/transcripts/:id/pdf', (req, res) => {
 });
 
 app.get('/api/config', (_req, res) =>
-  res.json({ hasKey: !!API_KEY, apifyTokens: APIFY_TOKENS.length, cached: { channels: channelCache.size, transcripts: transcriptCache.size } })
+  res.json({ hasKey: !!API_KEY, apifyTokens: APIFY_TOKENS.length, db: !!pool, cached: { channels: channelCache.size, transcripts: transcriptCache.size } })
 );
 
 // Only listen when run as the entrypoint, so test.mjs can import the helpers.
 // argv[1] is undefined under `node -e`, and pathToFileURL throws on undefined.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  initDb().catch((err) => console.error('db init failed:', err.message));
+
   app.listen(PORT, () => {
     console.log(`YouTube Outlier  →  http://localhost:${PORT}`);
     if (!API_KEY) console.log('⚠  YOUTUBE_API_KEY missing — add it to .env, then restart.');
   });
 }
 
-export { parseDuration, median, fetchTranscript, buildPdf, app };
+export { parseDuration, median, fetchTranscript, buildPdf, apifyTranscripts, app };

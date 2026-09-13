@@ -10,5 +10,7 @@ services:
         sync: false
       - key: APIFY_TOKENS
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: MAX_VIDEOS
         value: "2000"
