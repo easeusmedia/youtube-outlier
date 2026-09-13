@@ -211,8 +211,21 @@ async function initDb() {
       alias      TEXT PRIMARY KEY,
       channel_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS yt_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
   console.log('database ready');
+  // Whether YouTube blocks this host outlives the process. Render's free
+  // instance sleeps after 15 minutes idle, and rediscovering the block cost
+  // ~60s off the front of the first job after every single wake.
+  const saved = await pool.query(`SELECT value FROM yt_meta WHERE key = 'direct_blocked_until'`);
+  const until = Number(saved.rows[0]?.value || 0);
+  if (until > Date.now()) {
+    directBlockedUntil = until;
+    console.log('direct fetching known-blocked until', new Date(until).toISOString());
+  }
 }
 
 async function dbGetAlias(alias) {
@@ -555,9 +568,21 @@ function buildPdf({ channel, items }) {
     doc.moveDown(0.35);
     doc.text(new Date().toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' }));
 
-    /* ----- contents: reserved now, filled once page numbers are known ----- */
-    doc.addPage();
-    const tocPage = pageIndex();
+    /* ----- contents: reserved now, filled once page numbers are known -----
+     * One reserved page was a bug with teeth. Past ~20 entries the list ran
+     * off the bottom, and because each row is written at an explicit y, every
+     * row beyond the page then spawned a page of its own: 60 videos produced
+     * 173 pages instead of 62, most of them holding a single line. Rows are
+     * now one line each, so how many fit is arithmetic, and exactly that many
+     * pages get reserved. */
+    const TOC_ROW = 16;
+    const tocTop = 64 + 34; // top margin + the "Contents" heading
+    const tocPerPage = Math.max(1, Math.floor((doc.page.height - tocTop - 64) / TOC_ROW));
+    const tocPages = [];
+    for (let i = 0; i < Math.ceil(items.length / tocPerPage); i++) {
+      doc.addPage();
+      tocPages.push(pageIndex());
+    }
 
     /* ---------------- one entry per video ---------------- */
     const starts = [];
@@ -609,17 +634,22 @@ function buildPdf({ channel, items }) {
     });
 
     /* ------------- contents, now that pages are known ------------- */
-    doc.switchToPage(tocPage);
-    doc.font(BOLD).fontSize(20).fillColor(INK).text('Contents');
-    doc.moveDown(1);
     items.forEach((it, i) => {
-      const top = doc.y;
-      doc.font(REG).fontSize(9).fillColor(FAINT).text(String(i + 1).padStart(2, '0'), M, top, { width: 22 });
+      const page = tocPages[Math.floor(i / tocPerPage)];
+      const row = i % tocPerPage;
+      doc.switchToPage(page);
+      if (row === 0) {
+        doc.font(BOLD).fontSize(20).fillColor(INK).text('Contents', M, 64, { lineBreak: false });
+      }
+      const top = tocTop + row * TOC_ROW;
+      // lineBreak:false keeps every row to a single line, so nothing wraps past
+      // the page and triggers another one.
+      doc.font(REG).fontSize(9).fillColor(FAINT)
+        .text(String(i + 1).padStart(2, '0'), M, top, { width: 22, lineBreak: false });
       doc.font(REG).fontSize(10.5).fillColor(INK)
-        .text(it.title, M + 26, top - 1, { width: W() - 56, lineGap: 1 });
+        .text(it.title, M + 26, top - 1, { width: W() - 62, lineBreak: false, ellipsis: true });
       doc.font(REG).fontSize(9.5).fillColor(FAINT)
-        .text(String(starts[i] + 1), doc.page.width - M - 26, top, { width: 26, align: 'right' });
-      doc.y = Math.max(doc.y, top) + 7;
+        .text(String(starts[i] + 1), doc.page.width - M - 26, top, { width: 26, align: 'right', lineBreak: false });
     });
 
     /* ------------- running header and footer on every page ------------- */
@@ -635,7 +665,7 @@ function buildPdf({ channel, items }) {
       doc.page.margins.top = 0;
       doc.page.margins.bottom = 0;
 
-      if (p > range.start) {
+      if (!tocPages.includes(p) && p > range.start) {
         doc.font(REG).fontSize(8).fillColor(FAINT)
           .text(channel.title, M, 30, { width: W() - 60, lineBreak: false, ellipsis: true });
         doc.save().moveTo(M, 46).lineTo(doc.page.width - M, 46)
@@ -670,7 +700,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // clients before failing. Remember it instead, and re-test occasionally in case
 // the host's standing recovers.
 let directBlockedUntil = 0;
-const BLOCK_MEMORY_MS = 30 * 60 * 1000;
+const BLOCK_MEMORY_MS = 6 * 60 * 60 * 1000;
+
+function rememberBlocked() {
+  directBlockedUntil = Date.now() + BLOCK_MEMORY_MS;
+  if (!pool) return;
+  pool
+    .query(
+      `INSERT INTO yt_meta (key, value) VALUES ('direct_blocked_until', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [String(directBlockedUntil)]
+    )
+    .catch(() => {});
+}
 
 // Don't gate the Apify fallback on a list of known block symptoms. YouTube has
 // already changed shape once — it used to refuse with a 200 carrying
@@ -808,6 +850,10 @@ async function apifyTranscripts(videos, onCount) {
   const chunks = buckets.filter((b) => b.length);
 
   const workers = Math.min(chunks.length, slots);
+  console.log(
+    `apify: ${list.length} videos in ${chunks.length} chunk(s) of ~${chunks[0]?.length || 0}, ` +
+    `${workers} run(s) at once across ${tokens.length} account(s)`
+  );
   const items = [];
   const errors = [];
   const failed = [];
@@ -920,7 +966,7 @@ async function runJob(job, videos) {
           results[i] = { ...v, error: err.message };
           // Counting happens in pass 2, which decides each video's real fate.
           if (isTransportFailure(err.message)) {
-            if (++blockedStreak >= 3) directBlockedUntil = Date.now() + BLOCK_MEMORY_MS;
+            if (++blockedStreak >= 3) rememberBlocked();
           } else blockedStreak = 0;
         }
         job.current = v.title;

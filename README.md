@@ -79,7 +79,12 @@ Failed chunks are retried once at lower concurrency, because a chunk lost to
 throttling would otherwise show up in the PDF as "no captions available",
 which is a lie about the video.
 
-Measured end to end: **118 videos, all 118 transcribed, 113s.**
+Runs are spread across every configured account at once — with three keys the
+server logs `15 run(s) at once across 3 account(s)`. More accounts is the only
+way to raise that ceiling; each one adds 5 slots.
+
+Measured end to end: **118 videos, all 118 transcribed, 113s**; the long-form
+half of the same channel (50 videos), 86s.
 
 ## Known limits
 
@@ -89,6 +94,10 @@ Measured end to end: **118 videos, all 118 transcribed, 113s.**
   which is what makes a cold start fast (5.5s to 0.45s on a 330-video channel).
   Transcripts are deliberately not stored. Without the variable everything
   still works, just from memory.
+- The video list is fetched whole and filtered in the browser, so switching
+  between long-form, Shorts and All is instant. The list defaults to long-form;
+  Shorts are a different format with different norms, and the outlier score is
+  computed within each format for the same reason.
 - `MAX_VIDEOS` (default 2000) caps how many uploads are pulled per channel.
 - 500 videos max per transcript job.
 - Transcript speed is set by the longest video in the batch, not the count.
