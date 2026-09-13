@@ -268,74 +268,205 @@ async function fetchTranscript(videoId) {
  * PDF
  * ------------------------------------------------------------------ */
 
-// Helvetica is Latin-1 only, so anything outside it comes out blank. Look for a
-// wider font: macOS ships Arial Unicode, Render's Debian image ships DejaVu.
-// ponytail: DejaVu still has no Devanagari/CJK — bundle a Noto font if a
-// channel's captions actually come back in one of those scripts.
+/* ------------------------------------------------------------------ *
+ * PDF
+ * ------------------------------------------------------------------ */
+
+// Inter ships with the repo so a transcript looks the same on a Mac and on
+// Render. PDFKit's built-in Helvetica is Latin-1 only and has no real weights;
+// the system Unicode faces stay as a fallback for scripts Inter's Latin subset
+// can't draw, so a Hindi or Japanese transcript renders instead of coming out
+// as rows of empty boxes.
+const FONT_DIR = new URL('./assets/', import.meta.url).pathname;
+const INTER = {
+  regular: FONT_DIR + 'Inter-Regular.ttf',
+  semibold: FONT_DIR + 'Inter-SemiBold.ttf',
+  bold: FONT_DIR + 'Inter-Bold.ttf',
+};
+const hasInter = Object.values(INTER).every((p) => fs.existsSync(p));
 const UNICODE_FONT = [
   '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
   '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
   '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
 ].find((p) => fs.existsSync(p));
-const hasUnicodeFont = !!UNICODE_FONT;
+
+// Inter's Google subset covers Latin, general punctuation and currency. Past
+// that a transcript needs the wider system face.
+const needsUnicode = (s) => /[^\u0020-\u024F\u2000-\u206F\u20A0-\u20BF]/.test(s || '');
+
+const INK = '#14171F';
+const MUTED = '#6B7280';
+const FAINT = '#9CA3AF';
+const RULE = '#E4E7EC';
+const ACCENT = '#0B63CE';
+
+// A transcript arrives as one unbroken wall of words. Chunking it on sentence
+// boundaries is the difference between a document you can read and forty pages
+// of grey soup.
+function toParagraphs(text, perPara = 5) {
+  const out = [];
+  // Caption tracks mark a change of speaker with ">>". That's a genuine break
+  // in the transcript, so honour it before falling back to counting sentences.
+  for (const block of String(text).split(/\s*>>+\s*/)) {
+    const sentences = block.match(/[^.!?]+[.!?]+["')\]]*\s*|[^.!?]+$/g) || [block];
+    for (let i = 0; i < sentences.length; i += perPara) {
+      const para = sentences.slice(i, i + perPara).join('').trim();
+      if (para) out.push(para);
+    }
+  }
+  return out;
+}
 
 function buildPdf({ channel, items }) {
   return new Promise((resolve, reject) => {
-    // Without an explicit Title, viewers fall back to whatever they like —
-    // the filename, or the producing app — so name the document after the
-    // channel it's about.
+    const M = 56;
     const doc = new PDFDocument({
       size: 'A4',
-      margin: 54,
+      margins: { top: 64, bottom: 64, left: M, right: M },
       bufferPages: true,
-      info: { Title: channel.title, Author: channel.title, Subject: `Video transcripts for ${channel.title}` },
+      autoFirstPage: false,
+      info: { Title: channel.title, Author: channel.title, Subject: 'Video transcripts for ' + channel.title },
     });
     const chunks = [];
     doc.on('data', (c) => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    if (hasUnicodeFont) doc.registerFont('body', UNICODE_FONT);
-    const REG = hasUnicodeFont ? 'body' : 'Helvetica';
-    const BOLD = hasUnicodeFont ? 'body' : 'Helvetica-Bold';
+    if (hasInter) {
+      doc.registerFont('reg', INTER.regular);
+      doc.registerFont('semi', INTER.semibold);
+      doc.registerFont('bold', INTER.bold);
+    }
+    if (UNICODE_FONT) doc.registerFont('uni', UNICODE_FONT);
+    const REG = hasInter ? 'reg' : 'Helvetica';
+    const SEMI = hasInter ? 'semi' : 'Helvetica-Bold';
+    const BOLD = hasInter ? 'bold' : 'Helvetica-Bold';
+    // Falls back to the Latin face when there is no system Unicode font, which
+    // at least renders something rather than throwing.
+    const bodyFontFor = (text) => (needsUnicode(text) && UNICODE_FONT ? 'uni' : REG);
 
-    // Cover
-    doc.font(BOLD).fontSize(26).fillColor('#111').text(channel.title, { width: 460 });
-    doc.moveDown(0.3);
-    doc.font(REG).fontSize(11).fillColor('#666')
-      .text(`${items.length} transcript${items.length === 1 ? '' : 's'}  ·  generated ${new Date().toLocaleString()}`);
-    doc.moveDown(1.2);
-    doc.font(BOLD).fontSize(11).fillColor('#111').text('Contents');
-    doc.moveDown(0.4);
-    doc.font(REG).fontSize(10).fillColor('#333');
-    items.forEach((it, i) => doc.text(`${i + 1}.  ${it.title}`, { width: 470 }));
+    const W = () => doc.page.width - M * 2;
+    const pageIndex = () => doc.bufferedPageRange().count - 1;
 
-    for (const it of items) {
-      doc.addPage();
-      doc.font(BOLD).fontSize(15).fillColor('#111').text(it.title, { width: 470 });
-      doc.moveDown(0.35);
-      const meta = [
-        it.views.toLocaleString() + ' views',
-        new Date(it.publishedAt).toLocaleDateString(),
-        it.error ? null : it.auto ? 'auto-captions' : 'captions',
-      ].filter(Boolean).join('  ·  ');
-      doc.font(REG).fontSize(9).fillColor('#888').text(meta);
-      doc.fontSize(9).fillColor('#0073E6').text(`https://www.youtube.com/watch?v=${it.id}`);
-      doc.moveDown(0.9);
-      if (it.error) {
-        doc.font(REG).fontSize(10.5).fillColor('#b00').text(`No transcript: ${it.error}`);
-      } else {
-        doc.font(REG).fontSize(10.5).fillColor('#1a1a1a')
-          .text(it.text, { align: 'left', lineGap: 2.5 });
-      }
+    /* ---------------- cover ---------------- */
+    doc.addPage();
+    doc.font(REG).fontSize(9).fillColor(ACCENT)
+      .text('TRANSCRIPT COLLECTION', { characterSpacing: 1.6 });
+    doc.moveDown(1.1);
+    doc.font(BOLD).fontSize(34).fillColor(INK).text(channel.title, { width: W(), lineGap: 2 });
+    if (channel.handle) {
+      doc.moveDown(0.3);
+      doc.font(REG).fontSize(12).fillColor(MUTED).text(channel.handle);
     }
 
+    doc.moveDown(1.4);
+    const ruleY = doc.y;
+    doc.save().moveTo(M, ruleY).lineTo(M + 56, ruleY).lineWidth(3).strokeColor(ACCENT).stroke().restore();
+
+    const words = items.reduce((n, it) => n + (it.text ? it.text.trim().split(/\s+/).length : 0), 0);
+    const withText = items.filter((it) => it.text).length;
+    // Sit the stats on the baseline of the page rather than floating them in
+    // the middle of all that white space.
+    doc.y = doc.page.height - 64 - 52;
+    doc.font(REG).fontSize(10.5).fillColor(MUTED);
+    doc.text(withText + ' of ' + items.length + ' videos transcribed');
+    doc.moveDown(0.35);
+    doc.text(words.toLocaleString() + ' words');
+    doc.moveDown(0.35);
+    doc.text(new Date().toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' }));
+
+    /* ----- contents: reserved now, filled once page numbers are known ----- */
+    doc.addPage();
+    const tocPage = pageIndex();
+
+    /* ---------------- one entry per video ---------------- */
+    const starts = [];
+    items.forEach((it, i) => {
+      doc.addPage();
+      starts.push(pageIndex());
+
+      doc.font(REG).fontSize(9).fillColor(FAINT).text(String(i + 1).padStart(2, '0'));
+      doc.moveDown(0.45);
+      doc.font(SEMI).fontSize(17).fillColor(INK).text(it.title, { width: W(), lineGap: 1.5 });
+
+      doc.moveDown(0.5);
+      const meta = [
+        Number(it.views || 0).toLocaleString() + ' views',
+        new Date(it.publishedAt).toLocaleDateString(undefined, { dateStyle: 'medium' }),
+        it.error ? null : it.auto ? 'auto-generated captions' : 'captions',
+        it.text ? it.text.trim().split(/\s+/).length.toLocaleString() + ' words' : null,
+      ].filter(Boolean).join('   ·   ');
+      doc.font(REG).fontSize(9).fillColor(MUTED).text(meta, { width: W() });
+
+      doc.moveDown(0.3);
+      doc.font(REG).fontSize(8.5).fillColor(ACCENT)
+        .text('youtube.com/watch?v=' + it.id, {
+          width: W(),
+          link: 'https://www.youtube.com/watch?v=' + it.id,
+          underline: false,
+        });
+
+      doc.moveDown(0.9);
+      const y = doc.y;
+      doc.save().moveTo(M, y).lineTo(doc.page.width - M, y).lineWidth(0.75).strokeColor(RULE).stroke().restore();
+      doc.y = y + 20;
+
+      if (it.error) {
+        doc.font(REG).fontSize(10.5).fillColor(MUTED)
+          .text(
+            it.error === 'no captions available'
+              ? 'This video has no subtitles published on YouTube, so there is no transcript to pull.'
+              : 'Transcript unavailable — ' + it.error + '.',
+            { width: W() }
+          );
+        return;
+      }
+
+      doc.font(bodyFontFor(it.text)).fontSize(10.5).fillColor(INK);
+      for (const para of toParagraphs(it.text)) {
+        doc.text(para, { width: W(), align: 'left', lineGap: 3.2, paragraphGap: 9 });
+      }
+    });
+
+    /* ------------- contents, now that pages are known ------------- */
+    doc.switchToPage(tocPage);
+    doc.font(BOLD).fontSize(20).fillColor(INK).text('Contents');
+    doc.moveDown(1);
+    items.forEach((it, i) => {
+      const top = doc.y;
+      doc.font(REG).fontSize(9).fillColor(FAINT).text(String(i + 1).padStart(2, '0'), M, top, { width: 22 });
+      doc.font(REG).fontSize(10.5).fillColor(INK)
+        .text(it.title, M + 26, top - 1, { width: W() - 56, lineGap: 1 });
+      doc.font(REG).fontSize(9.5).fillColor(FAINT)
+        .text(String(starts[i] + 1), doc.page.width - M - 26, top, { width: 26, align: 'right' });
+      doc.y = Math.max(doc.y, top) + 7;
+    });
+
+    /* ------------- running header and footer on every page ------------- */
     const range = doc.bufferedPageRange();
     for (let i = 0; i < range.count; i++) {
-      doc.switchToPage(range.start + i);
-      doc.font(REG).fontSize(8).fillColor('#aaa')
-        .text(`${i + 1} / ${range.count}`, 54, doc.page.height - 38, { width: doc.page.width - 108, align: 'center' });
+      const p = range.start + i;
+      doc.switchToPage(p);
+      // Writing into the margins is what they are for, but doc.text()
+      // auto-paginates anything starting past the bottom margin, and that is
+      // exactly what silently added a blank page per footer and doubled the
+      // document. Drop the margins for the write, then put them back.
+      const saved = { ...doc.page.margins };
+      doc.page.margins.top = 0;
+      doc.page.margins.bottom = 0;
+
+      if (p > range.start) {
+        doc.font(REG).fontSize(8).fillColor(FAINT)
+          .text(channel.title, M, 30, { width: W() - 60, lineBreak: false, ellipsis: true });
+        doc.save().moveTo(M, 46).lineTo(doc.page.width - M, 46)
+          .lineWidth(0.5).strokeColor(RULE).stroke().restore();
+        doc.font(REG).fontSize(8).fillColor(FAINT)
+          .text(String(i + 1), M, doc.page.height - 40, { width: W(), align: 'center', lineBreak: false });
+      }
+
+      doc.page.margins = saved;
     }
+
     doc.end();
   });
 }
