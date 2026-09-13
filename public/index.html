@@ -27,6 +27,10 @@
     --hover-glow: 0 4px 14px -2px rgba(0,170,255,0.22);
   }
   * { box-sizing: border-box; }
+  /* An author `display` rule outranks the UA's [hidden] rule, so any element
+     with a display of its own ignores the hidden attribute. Fixed once here
+     rather than per element. */
+  [hidden] { display: none !important; }
   a { color: var(--accent); }
   body {
     margin: 0;
@@ -60,7 +64,7 @@
   main { max-width: 1500px; margin: 0 auto; padding: 24px 40px 40px; }
 
   .search-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-  input[type="text"], input[type="number"], select {
+  input[type="text"], input[type="number"], input[type="date"], select {
     background: rgba(255,255,255,0.08);
     backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--card-border-hover);
@@ -68,6 +72,7 @@
     font-size: 14px; font-family: inherit;
   }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input[type="date"] { color-scheme: dark; min-width: 0; }
   #channel-input { flex: 1; min-width: 300px; }
 
   button.primary {
@@ -325,7 +330,19 @@
       <option value="90">Last 3 months</option>
       <option value="180">Last 6 months</option>
       <option value="365">Last year</option>
+      <option value="custom">Custom range…</option>
     </select>
+  </div>
+
+  <div class="field-row" id="custom-range" hidden>
+    <div class="field">
+      <label>From</label>
+      <input id="f-from" type="date" />
+    </div>
+    <div class="field">
+      <label>To</label>
+      <input id="f-to" type="date" />
+    </div>
   </div>
 
   <div class="field-row">
@@ -359,6 +376,17 @@
   <button class="primary" id="transcript-btn">Get Transcript</button>
 </div>
 
+<div class="modal-backdrop" id="confirm-modal">
+  <div class="modal">
+    <h3 id="confirm-title">Transcribe these videos?</h3>
+    <div class="sub" id="confirm-body"></div>
+    <div class="modal-actions">
+      <button class="secondary" id="confirm-no">Cancel</button>
+      <button class="primary" id="confirm-yes">Start</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="job-modal">
   <div class="modal">
     <div class="modal-head">
@@ -384,7 +412,7 @@
 const $ = (id) => document.getElementById(id);
 let channel = null, videos = [], sort = 'latest', page = 1, jobId = null, poll = null;
 const PAGE = 60;
-const filters = { format: 'all', date: 'all', min: null, max: null, outlier: null };
+const filters = { format: 'all', date: 'all', from: null, to: null, min: null, max: null, outlier: null };
 
 const fmt = (n) => n >= 1e9 ? (n/1e9).toFixed(1)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
 const ago = (iso) => {
@@ -446,11 +474,20 @@ function renderChannel() {
 
 /* ---------- filter + sort ---------- */
 function visible() {
-  const cutoff = filters.date === 'all' ? 0 : Date.now() - Number(filters.date) * 86400000;
+  // A rolling window and a fixed range are the same question with different
+  // bounds, so collapse both into one [after, before] pair.
+  const custom = filters.date === 'custom';
+  const after = custom
+    ? (filters.from ? new Date(filters.from + 'T00:00:00').getTime() : 0)
+    : filters.date === 'all' ? 0 : Date.now() - Number(filters.date) * 86400000;
+  // The "to" date is inclusive, so run to the end of that day, not its start.
+  const before = custom && filters.to ? new Date(filters.to + 'T23:59:59').getTime() : Infinity;
   const list = videos.filter((v) => {
     if (filters.format === 'short' && !v.isShort) return false;
     if (filters.format === 'long' && v.isShort) return false;
-    if (cutoff && new Date(v.publishedAt).getTime() < cutoff) return false;
+    const at = new Date(v.publishedAt).getTime();
+    if (after && at < after) return false;
+    if (at > before) return false;
     if (filters.min != null && v.views < filters.min) return false;
     if (filters.max != null && v.views > filters.max) return false;
     if (filters.outlier != null && v.outlier < filters.outlier) return false;
@@ -497,10 +534,39 @@ function cardHtml(v) {
 }
 
 /* ---------- transcripts ---------- */
+// A native confirm() can't be styled and drops a system dialog on top of the
+// app. Same contract, resolving true/false, so callers still just await it.
+function askConfirm(body, okLabel = 'Start') {
+  return new Promise((resolve) => {
+    $('confirm-body').textContent = body;
+    $('confirm-yes').textContent = okLabel;
+    $('confirm-modal').classList.add('open');
+    const close = (answer) => {
+      $('confirm-modal').classList.remove('open');
+      document.removeEventListener('keydown', onKey);
+      resolve(answer);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') close(false); if (e.key === 'Enter') close(true); };
+    $('confirm-yes').onclick = () => close(true);
+    $('confirm-no').onclick = () => close(false);
+    $('confirm-modal').onclick = (e) => { if (e.target === $('confirm-modal')) close(false); };
+    document.addEventListener('keydown', onKey);
+    $('confirm-yes').focus();
+  });
+}
+
 async function startTranscripts() {
   const list = visible();
   if (!list.length) return;
-  if (list.length > 60 && !confirm(`${list.length} videos will be transcribed — roughly ${Math.ceil(list.length / 4 * 1.5 / 60)} min. Continue?`)) return;
+  // No time estimate: whether these come back direct or via Apify isn't known
+  // until the job runs, and the two differ by an order of magnitude.
+  if (list.length > 25) {
+    const ok = await askConfirm(
+      `${list.length} videos will be transcribed into one PDF. Large batches can take a few minutes — the progress bar will keep you posted.`,
+      `Transcribe ${list.length}`
+    );
+    if (!ok) return;
+  }
 
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
 
@@ -603,6 +669,9 @@ const openFilters = (open) => {
   $('filter-panel').classList.toggle('open', open);
   $('filter-backdrop').classList.toggle('open', open);
 };
+const syncCustomRange = () => { $('custom-range').hidden = $('f-date').value !== 'custom'; };
+$('f-date').onchange = syncCustomRange;
+
 $('filter-btn').onclick = () => openFilters(true);
 $('filter-close').onclick = () => openFilters(false);
 $('filter-backdrop').onclick = () => openFilters(false);
@@ -610,6 +679,8 @@ $('filter-backdrop').onclick = () => openFilters(false);
 const num = (el) => { const v = el.value.trim(); return v === '' ? null : Number(v); };
 $('filter-apply').onclick = () => {
   filters.date = $('f-date').value;
+  filters.from = $('f-from').value || null;
+  filters.to = $('f-to').value || null;
   filters.min = num($('f-min'));
   filters.max = num($('f-max'));
   filters.outlier = num($('f-outlier'));
@@ -619,8 +690,9 @@ $('filter-apply').onclick = () => {
 };
 $('filter-reset').onclick = () => {
   $('f-date').value = 'all'; $('f-min').value = ''; $('f-max').value = ''; $('f-outlier').value = '';
+  $('f-from').value = ''; $('f-to').value = ''; syncCustomRange();
   document.querySelectorAll('#seg-format button').forEach((x) => x.classList.toggle('active', x.dataset.format === 'all'));
-  Object.assign(filters, { format: 'all', date: 'all', min: null, max: null, outlier: null });
+  Object.assign(filters, { format: 'all', date: 'all', from: null, to: null, min: null, max: null, outlier: null });
   page = 1;
   render();
 };

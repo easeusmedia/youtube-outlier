@@ -281,7 +281,15 @@ const hasUnicodeFont = !!UNICODE_FONT;
 
 function buildPdf({ channel, items }) {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 54, bufferPages: true });
+    // Without an explicit Title, viewers fall back to whatever they like —
+    // the filename, or the producing app — so name the document after the
+    // channel it's about.
+    const doc = new PDFDocument({
+      size: 'A4',
+      margin: 54,
+      bufferPages: true,
+      info: { Title: channel.title, Author: channel.title, Subject: `Video transcripts for ${channel.title}` },
+    });
     const chunks = [];
     doc.on('data', (c) => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
@@ -346,7 +354,19 @@ const APIFY_TOKENS = (process.env.APIFY_TOKENS || process.env.APIFY_TOKEN || '')
 const APIFY_ACTOR = 'johnvc~YoutubeTranscripts';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const isBlocked = (msg) => /blocked by YouTube|rate-limited/i.test(msg || '');
+// Don't gate the Apify fallback on a list of known block symptoms. YouTube has
+// already changed shape once — it used to refuse with a 200 carrying
+// LOGIN_REQUIRED, now it's a bare 403 — and the old whitelist silently stopped
+// matching, so every video shipped as an error page instead of falling back.
+// Anything that failed direct now gets retried; at ~$0.00001 a video, paying
+// for the occasional one that genuinely has no captions costs nothing next to
+// handing someone a PDF full of "blocked by YouTube".
+//
+// This narrower test only decides when to STOP trying direct: a transport-level
+// refusal means the host is cut off and the rest will fail too, while "no
+// captions available" is about that one video and says nothing about the next.
+const isTransportFailure = (msg) =>
+  /blocked by YouTube|rate-limited|player \d+|captions \d+|fetch failed|network/i.test(msg || '');
 
 async function apifyTranscripts(videoIds, onTick) {
   if (!APIFY_TOKENS.length) throw new Error('no Apify token configured');
@@ -450,15 +470,16 @@ async function runJob(job, videos) {
           job.done++;
         } catch (err) {
           results[i] = { ...v, error: err.message };
-          if (isBlocked(err.message)) blockedStreak++; else { job.failed++; job.done++; }
+          // Counting happens in pass 2, which decides each video's real fate.
+          if (isTransportFailure(err.message)) blockedStreak++; else blockedStreak = 0;
         }
         job.current = v.title;
       }
     })
   );
 
-  // Pass 2: hand everything YouTube blocked to Apify, in one batched run.
-  const retry = results.filter((r) => isBlocked(r.error));
+  // Pass 2: hand everything that failed to Apify, in one batched run.
+  const retry = results.filter((r) => r.error);
   if (retry.length && APIFY_TOKENS.length) {
     job.stage = 'apify';
     job.current = `Routing ${retry.length} videos through Apify…`;
